@@ -3,18 +3,21 @@
 #include <MegaPiComm.h>
 
 namespace {
-constexpr uint8_t kEncoderSlot = SLOT1;
-constexpr int kMotorStartSpeed = 200;
+// Encoder motor object on the board slot selected by the library's SLOT macro.
+MeEncoderOnBoard motor(SLOT1);
 
+// Command characters accepted over USB/Bluetooth.
+constexpr int kMotorStartSpeed = 200;
 constexpr char kCmdStart = 'M';
 constexpr char kCmdStop = 'S';
+constexpr char kCmdStatus = 'B';
+constexpr char kCmdHelp = '?';
 constexpr char kCmdLed = 'L';
 constexpr char kCmdTest = 'T';
 
-MeEncoderOnBoard motor(kEncoderSlot);
-
-void isr_process_encoder()
-{
+// Interrupt handler for the motor encoder.
+// Reads encoder direction pin and updates pulse count accordingly.
+void isr_process_encoder() {
   if (digitalRead(motor.getPortB()) == 0) {
     motor.pulsePosMinus();
   } else {
@@ -22,63 +25,84 @@ void isr_process_encoder()
   }
 }
 
-void startMotor(MegaPiComm &bridge, HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, char command)
-{
-  (void)command;
-  motor.setMotorPwm(kMotorStartSpeed);
-  motor.updateSpeed();
-  bridge.sendAck(sourcePort, sourceName, F("MOTOR START"));
-}
+// Handle one incoming command character from USB or Bluetooth.
+// The command is normalized to uppercase, then dispatched.
+void handleBleChar(MegaPiComm &bridge, HardwareSerial &port, const __FlashStringHelper *source, char incoming) {
+  const char cmd = (incoming >= 'a' && incoming <= 'z')
+      ? static_cast<char>(incoming - ('a' - 'A'))
+      : incoming;
 
-void stopMotor(MegaPiComm &bridge, HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, char command)
-{
-  (void)command;
-  motor.setMotorPwm(0);
-  motor.updateSpeed();
-  bridge.sendAck(sourcePort, sourceName, F("MOTOR STOP"));
-}
+  Serial.print(F("CMD from "));
+  Serial.print(source);
+  Serial.print(F(": '"));
+  Serial.print(cmd);
+  Serial.println(F("'"));
 
-void toggleLed(MegaPiComm &bridge, HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, char command)
-{
-  (void)command;
-  digitalWrite(LED_BUILTIN, digitalRead(LED_BUILTIN) == HIGH ? LOW : HIGH);
-  bridge.sendAck(sourcePort, sourceName, F("LED TOGGLED"));
-}
-
-void testLink(MegaPiComm &bridge, HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, char command)
-{
-  (void)command;
-  bridge.sendAck(sourcePort, sourceName, F("TEST OK"));
-}
-
-bool handleUnknown(MegaPiComm &bridge, HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, char command)
-{
-  (void)bridge;
-  (void)sourceName;
-  if (command >= 32 && command < 127) {
-    sourcePort.print(F("Unknown command: "));
-    sourcePort.println(command);
-    return true;
+  if (cmd == kCmdStart) {
+    // Start motor at a fixed PWM value.
+    motor.setMotorPwm(kMotorStartSpeed);
+    motor.updateSpeed();
+    bridge.sendLine(port, F("MOTOR START"));
+    return;
   }
-  return false;
+
+  if (cmd == kCmdStop) {
+    // Stop motor.
+    motor.setMotorPwm(0);
+    motor.updateSpeed();
+    bridge.sendLine(port, F("MOTOR STOP"));
+    return;
+  }
+
+  if (cmd == kCmdLed) {
+    // Toggle onboard status LED.
+    digitalWrite(LED_BUILTIN, digitalRead(LED_BUILTIN) == HIGH ? LOW : HIGH);
+    bridge.sendLine(port, F("LED TOGGLED"));
+    return;
+  }
+
+  if (cmd == kCmdTest) {
+    bridge.sendLine(port, F("TEST OK"));
+    return;
+  }
+
+  if (cmd == kCmdStatus) {
+    bridge.sendLine(port, F("BT baud: 115200"));
+    bridge.sendLine(port, F("Motor mode: Encoder SLOT2"));
+    return;
+  }
+
+  if (cmd == kCmdHelp) {
+    bridge.sendLine(port, F("Commands: M=start, S=stop, L=led, T=test, B=status, ?=help"));
+    return;
+  }
+
+  if (cmd >= 32 && cmd < 127) {
+    // Printable but unsupported command.
+    port.print(F("Unknown command: "));
+    port.println(cmd);
+  }
 }
 
-MegaPiCommConfig makeConfig()
-{
-  MegaPiCommConfig config;
-  config.usbBaud = 115200;
-  config.bluetoothBaud = 115200;  // Held at 115200 by library to ensure BLE compatibility.
-  config.verboseRxLogging = false;
-  config.helpCommand = '?';
-  config.statusCommand = 'B';
-  return config;
+// Build serial settings used by the communication bridge.
+MegaPiCommConfig makeConfig() {
+  MegaPiCommConfig c;
+  c.usbBaud = 115200;
+  c.bluetoothBaud = 115200;  // Held fixed at 115200 by the library.
+  c.verboseRxLogging = false;
+  c.ignoreWhitespace = true;
+  return c;
 }
 
-MegaPiComm communicator(makeConfig());
+MegaPiComm comm(makeConfig());
 }  // namespace
 
-void setup()
-{
+void setup() {
+  // Initialize status LED.
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // Attach encoder interrupt so pulse count updates continuously.
   attachInterrupt(motor.getIntNum(), isr_process_encoder, RISING);
 
   // Set PWM to 8KHz for encoder motor drive.
@@ -87,19 +111,16 @@ void setup()
   TCCR2A = _BV(WGM21) | _BV(WGM20);
   TCCR2B = _BV(CS21);
 
-  communicator.setHelpText(F("M=start, S=stop, L=LED toggle, T=test, B=status, ?=help"));
-  communicator.setCommandHandler(kCmdStart, startMotor);
-  communicator.setCommandHandler(kCmdStop, stopMotor);
-  communicator.setCommandHandler(kCmdLed, toggleLed);
-  communicator.setCommandHandler(kCmdTest, testLink);
-  communicator.setUnknownCommandHandler(handleUnknown);
+  // Register command callback and start serial links.
+  comm.setReceiveHandler(handleBleChar);
+  comm.begin();
 
-  communicator.begin();
+  // Start in a known safe state with the motor stopped.
   motor.setMotorPwm(0);
   motor.updateSpeed();
 }
 
-void loop()
-{
-  communicator.poll();
+void loop() {
+  // Non-blocking poll processes incoming USB/Bluetooth data.
+  comm.poll();
 }
