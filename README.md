@@ -1,36 +1,45 @@
 # MegaPiComm
-MegaPiComm is a lightweight command bridge for MegaPi projects.
-It reads commands from USB serial and Bluetooth serial channels, then dispatches those commands to handlers you define in your sketch.
 
-The library is intentionally generic:
-- Motor behavior stays in your sketch.
-- Project-specific commands stay in your sketch.
-- Transport and command routing live in the library.
+MegaPiComm is a minimal BLE serial transport for MegaPi projects.
 
-## What It Does
+It does one job:
+- read incoming characters from Bluetooth serial channels
+- pass those characters to your sketch callback
+- provide simple send helpers to write text/bytes back
 
-- Initializes USB and hardware serial channels (`Serial`, `Serial1`, `Serial2`, `Serial3`)
-- Holds Bluetooth UART at **115200** (`MegaPiComm::kFixedBluetoothBaud`)
-- Normalizes letter commands to uppercase
-- Routes commands to handlers registered with `setCommandHandler(...)`
-- Provides built-in help and status commands
-- Supports optional unknown-command handling
-- Provides ACK helper for response messages
+It does not implement motor logic, command parsing, or project behavior.
+Your `main.cpp` owns all command interpretation and peripheral control.
 
-## Install / Layout
+## Dependency Setup
 
-This project uses PlatformIO private libraries.
+This project includes two dependency manifests:
 
-Place the library here:
+- `lib/MegaPiComm/library.json`: PlatformIO library metadata and Arduino dependency declaration
+- `requirements.txt` (project root): Python dependencies for BLE tooling
 
-- `lib/MegaPiComm/src/MegaPiComm.h`
-- `lib/MegaPiComm/src/MegaPiComm.cpp`
+### requirements.txt
 
-Then include it from your sketch:
+Expected contents:
 
-```cpp
-#include <MegaPiComm.h>
+```txt
+bleak>=3.0.2
+pynput>=1.8.0
 ```
+
+### Install commands
+
+```powershell
+pip install -r requirements.txt
+platformio run
+```
+
+## Library Behavior
+
+- USB serial (`Serial`) starts at `config.usbBaud`
+- Bluetooth serial transport always runs at **115200** (`MegaPiComm::kFixedBluetoothBaud`)
+- Polls `Serial1`, `Serial2`, and `Serial3` for BLE bridge traffic
+- Calls your receive handler for each incoming character
+- Optionally ignores whitespace (`\r`, `\n`, space, tab)
 
 ## Quick Start
 
@@ -40,7 +49,7 @@ Then include it from your sketch:
 #include <MegaPiComm.h>
 
 namespace {
-MeEncoderOnBoard motor(SLOT1);
+MeEncoderOnBoard motor(SLOT2);
 
 void isr_process_encoder() {
   if (digitalRead(motor.getPortB()) == 0) {
@@ -50,27 +59,37 @@ void isr_process_encoder() {
   }
 }
 
-void startMotor(MegaPiComm &bridge, HardwareSerial &port, const __FlashStringHelper *source, char cmd) {
-  (void)cmd;
-  motor.setMotorPwm(200);
-  motor.updateSpeed();
-  bridge.sendAck(port, source, F("MOTOR START"));
-}
+void onBleChar(MegaPiComm &bridge, HardwareSerial &port, const __FlashStringHelper *source, char incoming) {
+  const char cmd = (incoming >= 'a' && incoming <= 'z')
+      ? static_cast<char>(incoming - ('a' - 'A'))
+      : incoming;
 
-void stopMotor(MegaPiComm &bridge, HardwareSerial &port, const __FlashStringHelper *source, char cmd) {
-  (void)cmd;
-  motor.setMotorPwm(0);
-  motor.updateSpeed();
-  bridge.sendAck(port, source, F("MOTOR STOP"));
+  if (cmd == 'M') {
+    motor.setMotorPwm(200);
+    motor.updateSpeed();
+    bridge.sendLine(port, F("MOTOR START"));
+    return;
+  }
+
+  if (cmd == 'S') {
+    motor.setMotorPwm(0);
+    motor.updateSpeed();
+    bridge.sendLine(port, F("MOTOR STOP"));
+    return;
+  }
+
+  if (cmd == 'T') {
+    bridge.sendLine(port, F("TEST OK"));
+    return;
+  }
 }
 
 MegaPiCommConfig makeConfig() {
   MegaPiCommConfig c;
   c.usbBaud = 115200;
-  c.bluetoothBaud = 115200; // Library keeps BLE UART fixed at 115200.
+  c.bluetoothBaud = 115200;  // Informational; library enforces fixed 115200.
   c.verboseRxLogging = false;
-  c.helpCommand = '?';
-  c.statusCommand = 'B';
+  c.ignoreWhitespace = true;
   return c;
 }
 
@@ -80,11 +99,16 @@ MegaPiComm comm(makeConfig());
 void setup() {
   attachInterrupt(motor.getIntNum(), isr_process_encoder, RISING);
 
-  comm.setHelpText(F("M=start, S=stop, B=status, ?=help"));
-  comm.setCommandHandler('M', startMotor);
-  comm.setCommandHandler('S', stopMotor);
+  TCCR1A = _BV(WGM10);
+  TCCR1B = _BV(CS11) | _BV(WGM12);
+  TCCR2A = _BV(WGM21) | _BV(WGM20);
+  TCCR2B = _BV(CS21);
 
+  comm.setReceiveHandler(onBleChar);
   comm.begin();
+
+  motor.setMotorPwm(0);
+  motor.updateSpeed();
 }
 
 void loop() {
@@ -92,110 +116,39 @@ void loop() {
 }
 ```
 
-## DC Motor Example
+## API Summary
 
-If you are using a regular MegaPi DC motor output instead of encoder motor control:
+### Config
 
-```cpp
-#include <Arduino.h>
-#include <MeMegaPi.h>
-#include <MegaPiComm.h>
+`MegaPiCommConfig`
 
-namespace {
-MeMegaPiDCMotor motor(PORT1A);
+- `usbBaud`: USB monitor baud
+- `bluetoothBaud`: informational only; BLE remains fixed at 115200
+- `verboseRxLogging`: prints hex RX logs to USB serial
+- `ignoreWhitespace`: skips CR/LF/space/tab before callback
 
-void startMotor(MegaPiComm &bridge, HardwareSerial &port, const __FlashStringHelper *source, char cmd) {
-  (void)cmd;
-  motor.run(180);
-  bridge.sendAck(port, source, F("DC MOTOR START"));
-}
-
-void stopMotor(MegaPiComm &bridge, HardwareSerial &port, const __FlashStringHelper *source, char cmd) {
-  (void)cmd;
-  motor.stop();
-  bridge.sendAck(port, source, F("DC MOTOR STOP"));
-}
-
-MegaPiComm comm;
-}  // namespace
-
-void setup() {
-  comm.setHelpText(F("M=start DC motor, S=stop DC motor, B=status, ?=help"));
-  comm.setCommandHandler('M', startMotor);
-  comm.setCommandHandler('S', stopMotor);
-  comm.begin();
-}
-
-void loop() {
-  comm.poll();
-}
-```
-
-Tip: Change `PORT1A` to `PORT1B`, `PORT2A`, `PORT2B`, `PORT3A`, `PORT3B`, `PORT4A`, or `PORT4B` based on your wiring.
-
-## Configuration
-
-Use `MegaPiCommConfig`:
-
-- `usbBaud`: USB serial monitor baud rate
-- `bluetoothBaud`: informational input; BLE UART still uses fixed 115200
-- `verboseRxLogging`: print per-byte RX debug logs when true
-- `helpCommand`: built-in help trigger (default `?`)
-- `statusCommand`: built-in status trigger (default `B`)
-
-## Core API
-
-### Construction
+### Core
 
 - `MegaPiComm(const MegaPiCommConfig &config)`
+- `void begin()`
+- `void poll()`
+- `void setReceiveHandler(MegaPiRxHandler handler)`
 
-### Runtime
+### Port helpers
 
-- `begin()`
-- `poll()`
+- `bool hasActiveBlePort() const`
+- `HardwareSerial *activeBlePort()`
+- `const __FlashStringHelper *sourceLabel(HardwareSerial &port) const`
 
-### Command Binding
+### TX helpers
 
-- `bool setCommandHandler(char command, MegaPiCommandHandler handler)`
-- `void clearCommandHandlers()`
-- `void setUnknownCommandHandler(MegaPiUnknownCommandHandler handler)`
-
-### Built-in Text
-
-- `void setHelpText(const __FlashStringHelper *helpText)`
-- `void printHelp(HardwareSerial &port)`
-- `void printStatus(HardwareSerial &port)`
-
-### Response Helpers
-
+- `void sendChar(HardwareSerial &port, char value)`
+- `void sendText(HardwareSerial &port, const char *message)`
+- `void sendLine(HardwareSerial &port, const char *message)`
 - `void sendLine(HardwareSerial &port, const __FlashStringHelper *message)`
-- `void sendAck(HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, const __FlashStringHelper *message)`
-
-## Handler Signatures
-
-Command handler:
-
-```cpp
-void myHandler(MegaPiComm &bridge,
-               HardwareSerial &sourcePort,
-               const __FlashStringHelper *sourceName,
-               char command)
-```
-
-Unknown-command handler:
-
-```cpp
-bool myUnknownHandler(MegaPiComm &bridge,
-                      HardwareSerial &sourcePort,
-                      const __FlashStringHelper *sourceName,
-                      char command)
-```
-
-Return `true` if handled; `false` to let default unknown handling run.
 
 ## Notes
 
-- Call `poll()` continuously in `loop()` for responsive command handling.
-- Register all handlers before calling `begin()`.
-- Keep heavy work out of command handlers where possible.
-- Sketch owns all hardware behavior (motor, sensors, etc.).
+- Keep command parsing in your sketch callback.
+- Keep hardware/peripheral control in your sketch.
+- Call `poll()` continuously in `loop()`.
