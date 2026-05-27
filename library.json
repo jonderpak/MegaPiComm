@@ -1,0 +1,21 @@
+{
+  "name": "MegaPiComm",
+  "version": "0.1.0",
+  "description": "Generic USB/BLE command bridge for MegaPi projects",
+  "keywords": [
+    "megapi",
+    "bluetooth",
+    "serial",
+    "bridge",
+    "robotics"
+  ],
+  "frameworks": "arduino",
+  "platforms": "atmelavr",
+  "dependencies": [
+    {
+      "owner": "makeblock-official",
+      "name": "MakeBlockDrive",
+      "version": "^3.27"
+    }
+  ]
+}
