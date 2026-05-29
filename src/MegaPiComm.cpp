@@ -2,30 +2,23 @@
 
 MegaPiComm::MegaPiComm(const MegaPiCommConfig &config)
     : config_(config),
-      commandCount_(0),
-      unknownCommandHandler_(nullptr),
-      helpText_(F("No help text configured.")),
-      bluetoothPortDetected_(false)
+      rxHandler_(nullptr),
+      bluetoothPortDetected_(false),
+      activeBlePort_(nullptr)
 {
 }
 
 void MegaPiComm::begin()
 {
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-
   Serial.begin(config_.usbBaud);
   Serial1.begin(kFixedBluetoothBaud);
   Serial2.begin(kFixedBluetoothBaud);
   Serial3.begin(kFixedBluetoothBaud);
 
-  sendLine(Serial, F("MegaPi USB + Bluetooth communicator ready."));
+  sendLine(Serial, F("MegaPi BLE transport ready."));
   if (config_.bluetoothBaud != kFixedBluetoothBaud) {
     sendLine(Serial, F("Requested BLE baud ignored; using fixed 115200."));
   }
-
-  printStatus(Serial);
-  printHelp(Serial);
 }
 
 void MegaPiComm::poll()
@@ -33,86 +26,41 @@ void MegaPiComm::poll()
   pollSerialPort(Serial1, F("Serial1"));
   pollSerialPort(Serial2, F("Serial2"));
   pollSerialPort(Serial3, F("Serial3"));
-  pollSerialPort(Serial, F("Serial(USB)"));
 }
 
-bool MegaPiComm::setCommandHandler(char command, MegaPiCommandHandler handler)
+void MegaPiComm::setReceiveHandler(MegaPiRxHandler handler)
 {
-  const char normalized = normalizeCommand(command);
-
-  for (uint8_t i = 0; i < commandCount_; ++i) {
-    if (commandBindings_[i].command == normalized) {
-      commandBindings_[i].handler = handler;
-      return true;
-    }
-  }
-
-  if (commandCount_ >= kMaxCommands) {
-    return false;
-  }
-
-  commandBindings_[commandCount_].command = normalized;
-  commandBindings_[commandCount_].handler = handler;
-  ++commandCount_;
-  return true;
+  rxHandler_ = handler;
 }
 
-void MegaPiComm::clearCommandHandlers()
+bool MegaPiComm::hasActiveBlePort() const
 {
-  commandCount_ = 0;
+  return activeBlePort_ != nullptr;
 }
 
-void MegaPiComm::setUnknownCommandHandler(MegaPiUnknownCommandHandler handler)
+HardwareSerial *MegaPiComm::activeBlePort()
 {
-  unknownCommandHandler_ = handler;
+  return activeBlePort_;
 }
 
-void MegaPiComm::setHelpText(const __FlashStringHelper *helpText)
+void MegaPiComm::sendChar(HardwareSerial &port, char value)
 {
-  helpText_ = helpText ? helpText : F("No help text configured.");
+  port.write(value);
 }
 
-void MegaPiComm::printHelp(HardwareSerial &port)
+void MegaPiComm::sendText(HardwareSerial &port, const char *message)
 {
-  port.print(F("Help: "));
-  port.println(helpText_);
-  port.print(F("Built-ins: "));
-  port.print(config_.helpCommand);
-  port.print(F("=help, "));
-  port.print(config_.statusCommand);
-  port.println(F("=status"));
+  port.print(message);
 }
 
-void MegaPiComm::printStatus(HardwareSerial &port)
+void MegaPiComm::sendLine(HardwareSerial &port, const char *message)
 {
-  port.print(F("USB baud: "));
-  port.println(config_.usbBaud);
-  port.print(F("BT baud (fixed): "));
-  port.println(kFixedBluetoothBaud);
+  port.println(message);
 }
 
 void MegaPiComm::sendLine(HardwareSerial &port, const __FlashStringHelper *message)
 {
   port.println(message);
-}
-
-void MegaPiComm::sendAck(HardwareSerial &sourcePort, const __FlashStringHelper *sourceName, const __FlashStringHelper *message)
-{
-  sourcePort.println(message);
-  if (&sourcePort != &Serial) {
-    Serial.print(F("ACK -> "));
-    Serial.print(sourceName);
-    Serial.print(F(": "));
-    Serial.println(message);
-  }
-}
-
-char MegaPiComm::normalizeCommand(char cmd) const
-{
-  if (cmd >= 'a' && cmd <= 'z') {
-    return static_cast<char>(cmd - ('a' - 'A'));
-  }
-  return cmd;
 }
 
 const __FlashStringHelper *MegaPiComm::portLabel(HardwareSerial &port) const
@@ -129,13 +77,9 @@ const __FlashStringHelper *MegaPiComm::portLabel(HardwareSerial &port) const
   return F("Serial(USB)");
 }
 
-void MegaPiComm::reportCommandSource(char cmd, const __FlashStringHelper *sourceName)
+const __FlashStringHelper *MegaPiComm::sourceLabel(HardwareSerial &port) const
 {
-  Serial.print(F("CMD from "));
-  Serial.print(sourceName);
-  Serial.print(F(": '"));
-  Serial.print(cmd);
-  Serial.println(F("'"));
+  return portLabel(port);
 }
 
 void MegaPiComm::logRawByte(const __FlashStringHelper *portName, uint8_t incoming)
@@ -156,44 +100,6 @@ void MegaPiComm::logRawByte(const __FlashStringHelper *portName, uint8_t incomin
   Serial.println();
 }
 
-void MegaPiComm::handleCommand(char cmd, HardwareSerial &sourcePort, const __FlashStringHelper *sourceName)
-{
-  if (&sourcePort != &Serial && !bluetoothPortDetected_) {
-    bluetoothPortDetected_ = true;
-    Serial.print(F("Detected active Bluetooth UART on "));
-    Serial.println(portLabel(sourcePort));
-  }
-
-  const char normalized = normalizeCommand(cmd);
-  reportCommandSource(normalized, sourceName);
-
-  if (normalized == normalizeCommand(config_.statusCommand)) {
-    printStatus(sourcePort);
-    return;
-  }
-
-  if (normalized == normalizeCommand(config_.helpCommand)) {
-    printHelp(sourcePort);
-    return;
-  }
-
-  for (uint8_t i = 0; i < commandCount_; ++i) {
-    if (commandBindings_[i].command == normalized && commandBindings_[i].handler != nullptr) {
-      commandBindings_[i].handler(*this, sourcePort, sourceName, normalized);
-      return;
-    }
-  }
-
-  if (unknownCommandHandler_ != nullptr && unknownCommandHandler_(*this, sourcePort, sourceName, normalized)) {
-    return;
-  }
-
-  if (normalized >= 32 && normalized < 127) {
-    sourcePort.print(F("Unknown: "));
-    sourcePort.println(normalized);
-  }
-}
-
 void MegaPiComm::pollSerialPort(HardwareSerial &port, const __FlashStringHelper *portName)
 {
   while (port.available() > 0) {
@@ -204,8 +110,23 @@ void MegaPiComm::pollSerialPort(HardwareSerial &port, const __FlashStringHelper 
       logRawByte(portName, raw);
     }
 
-    if (incoming != '\r' && incoming != '\n' && incoming != ' ' && incoming != '\t') {
-      handleCommand(incoming, port, portName);
+    if (&port != &Serial) {
+      if (!bluetoothPortDetected_) {
+        bluetoothPortDetected_ = true;
+        activeBlePort_ = &port;
+        Serial.print(F("Detected active Bluetooth UART on "));
+        Serial.println(portLabel(port));
+      } else if (activeBlePort_ == nullptr) {
+        activeBlePort_ = &port;
+      }
+    }
+
+    if (config_.ignoreWhitespace && (incoming == '\r' || incoming == '\n' || incoming == ' ' || incoming == '\t')) {
+      continue;
+    }
+
+    if (rxHandler_ != nullptr) {
+      rxHandler_(*this, port, portName, incoming);
     }
   }
 }
